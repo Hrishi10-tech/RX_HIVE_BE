@@ -1,0 +1,22 @@
+# The Dockerfile only COPYs alembic.ini, alembic/ and app/, so nothing else was
+# reaching the image — but everything here was still being sent to the daemon as
+# build context on every build, including a ~200 MB .venv.
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+htmlcov
+.coverage
+tests
+.git
+.gitignore
+Dockerfile
+.dockerignore
+
+# Never let a real environment file into the build context.
+.env
+.env.*
+!.env.example

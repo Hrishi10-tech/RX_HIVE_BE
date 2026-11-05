@@ -1,0 +1,13 @@
+-r requirements.txt
+pytest==8.3.4
+pytest-asyncio==0.25.3
+ruff==0.9.6
+aiosqlite==0.20.0
+websockets==14.2
+# Test-only, and pinned rather than leaned on transitively: it is present in the
+# environment today via another package, and Batch 47 added a check precisely
+# because a direct dependency the resolver happens to satisfy is still a direct
+# dependency. tests/test_dependabot_coverage_check.py parses dependabot.yml with
+# it, having previously asserted on the file's exact inline spelling — which a
+# valid block-style sequence would have failed and a comment could have satisfied.
+PyYAML==6.0.3
