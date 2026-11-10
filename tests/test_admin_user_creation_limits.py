@@ -240,6 +240,23 @@ async def test_an_admin_can_still_manage_their_own_account(client):
     assert resp.json()["display_name"] == "My New Name"
 
 
+async def test_an_admin_cannot_deactivate_or_demote_themselves(client):
+    """Their own row, but not every field of it: either change ends their access
+    to this portal, and only a superadmin could give it back. The drawer's
+    no-op save (role="admin", is_active=True) still goes through."""
+    org, _, _, admin = await _fixture("No Lockout Co")
+
+    async with _as("adm@NoLockoutCo.com") as c:
+        deactivate = await c.put(f"/api/org-admin/users/{admin.id}", json={"is_active": False})
+        demote = await c.put(f"/api/org-admin/users/{admin.id}", json={"role": "member"})
+        noop = await c.put(f"/api/org-admin/users/{admin.id}", json={"role": "admin", "is_active": True})
+
+    assert deactivate.status_code == 400, deactivate.text
+    assert demote.status_code == 400, demote.text
+    assert noop.status_code == 200, noop.text
+    assert await _role_of("adm@NoLockoutCo.com") is UserRole.org_admin
+
+
 async def test_peer_admins_are_still_listed(client):
     """Blocked from MUTATING, not from seeing.
 

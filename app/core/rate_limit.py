@@ -126,3 +126,5 @@ upload_limiter = RateLimiter("upload", default_times=30)
 # still resolving holds a thread. Low by design — a browser subscribes once per
 # subscription change, not once per page.
 push_subscribe_limiter = RateLimiter("push_subscribe", default_times=10)
+# Uncached link-preview fetches (each one is an outbound request from the server).
+link_preview_limiter = RateLimiter("link_preview", default_times=60)

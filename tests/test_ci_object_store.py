@@ -49,7 +49,7 @@ import re
 import pytest
 import yaml
 
-ROOT = pathlib.Path(__file__).resolve().parents[2] / "rxhive"
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 COMPOSE_FILES = (
     ROOT / "infra" / "docker-compose.yml",

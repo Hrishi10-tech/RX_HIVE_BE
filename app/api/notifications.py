@@ -1,10 +1,12 @@
-"""Notifications (net-new vs the Mongo build): in-app list + Web Push subs."""
+"""Notifications (net-new vs the Mongo build): in-app list, Web Push subs, and the
+per-user push preferences the server applies when it sends push."""
 
 import anyio
 import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import delete, select, update
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from sqlalchemy import cast, delete, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -12,6 +14,7 @@ from app.core.deps import get_current_user, get_current_user_pending_password_ch
 from app.core.rate_limit import push_subscribe_limiter
 from app.db.models import Notification, PushSubscription, User
 from app.db.session import get_db
+from app.services.notification_prefs import effective_prefs
 from app.utils import iso_z
 
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
@@ -78,6 +81,53 @@ async def read_all(user: User = Depends(get_current_user), db: AsyncSession = De
     )
     await db.commit()
     return {"message": "Marked as read"}
+
+
+class PreferencesUpdate(BaseModel):
+    """Partial update: send only the keys being changed. StrictBool so "false" or 0
+    is a 422 rather than a silently coerced value, and extra="forbid" so a typo'd
+    key is refused instead of reported as saved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    show_preview: StrictBool | None = None
+    messages: StrictBool | None = None
+    groups: StrictBool | None = None
+    calls: StrictBool | None = None
+
+
+@router.get("/preferences")
+async def get_preferences(user: User = Depends(get_current_user)):
+    """The caller's push preferences, every key present with its default filled in."""
+    return effective_prefs(user.notification_prefs)
+
+
+@router.put("/preferences")
+async def update_preferences(
+    body: PreferencesUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Change some preferences; returns the full, effective set.
+
+    Merged in SQL (jsonb `||`) rather than read-modify-write in Python, so two
+    devices each flipping a different switch at the same moment both land.
+    """
+    patch = body.model_dump(exclude_unset=True)
+    if any(value is None for value in patch.values()):
+        raise HTTPException(status_code=422, detail="Preference values must be true or false")
+    stored = user.notification_prefs
+    if patch:
+        stored = (
+            await db.execute(
+                update(User)
+                .where(User.id == user.id)
+                .values(notification_prefs=User.notification_prefs.op("||")(cast(patch, JSONB)))
+                .returning(User.notification_prefs)
+            )
+        ).scalar_one()
+        await db.commit()
+    return effective_prefs(stored)
 
 
 class SubscribeRequest(BaseModel):

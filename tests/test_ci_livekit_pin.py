@@ -15,7 +15,7 @@ import re
 
 import pytest
 
-CI = pathlib.Path(__file__).resolve().parents[2] / "rxhive" / ".github" / "workflows" / "ci.yml"
+CI = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 
 
 def test_livekit_is_pinned_to_a_version_and_its_checksum():

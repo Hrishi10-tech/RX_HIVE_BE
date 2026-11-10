@@ -149,6 +149,7 @@ from app.api import (  # noqa: E402
     conversations,
     cross_org,
     groups,
+    link_preview,
     media,
     messages,
     notifications,
@@ -182,6 +183,7 @@ app.include_router(calls.router)
 # browser and cannot send X-Requested-With.
 app.include_router(calls.webhook_router)
 app.include_router(notifications.router)
+app.include_router(link_preview.router)
 app.include_router(hub.router)
 
 

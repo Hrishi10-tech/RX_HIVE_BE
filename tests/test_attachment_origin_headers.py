@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-INFRA = Path(__file__).resolve().parents[2] / "rxhive" / "infra"
+INFRA = Path(__file__).resolve().parents[2] / "infra"
 
 # Both files, because dev is expected to mirror prod here — Caddyfile's own
 # comments say "exactly as in Caddyfile.prod" about the neighbouring directive.

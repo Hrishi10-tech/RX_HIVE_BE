@@ -461,14 +461,17 @@ async def forward_message(
     body: ForwardRequest,
     tenant: TenantContext = Depends(get_tenant),
 ):
+    copies: list[dict] = []
     forwarded = await messaging.forward_message(
         tenant.db,
         actor=tenant.user,
         message_id=_msg_uuid(body.message_id),
         conversation_ids=body.conversation_ids,
         contact_ids=body.contact_ids,
+        copies=copies,
     )
-    return {"forwarded_to": forwarded}
+    # `messages` is additive: older clients (iOS decodes only forwarded_to) ignore it.
+    return {"forwarded_to": forwarded, "messages": copies}
 
 
 # DELETE /messages/{msg_id} removed along with the message-deletion feature. The

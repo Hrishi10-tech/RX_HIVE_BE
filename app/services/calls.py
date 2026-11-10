@@ -57,6 +57,7 @@ from app.db.models import (
 from app.db.session import SessionLocal
 from app.realtime.redis_bus import get_redis, publish_to_users
 from app.services import call_deadlines, enrich, presence
+from app.services.notification_prefs import effective_prefs
 from app.utils import iso_z, now_utc
 
 logger = logging.getLogger(__name__)
@@ -403,6 +404,18 @@ async def _ring_timeout(call_id: uuid.UUID) -> None:
                 "call_type": call.type.value,
             },
         )
+        # Direct calls only. Group calls are created `connected` and never ring
+        # through here, but the guard keeps a future group ring from pushing every
+        # member a "missed call" for a call others answered.
+        if not call.is_group:
+            await _push_missed_call(
+                db,
+                call_id=call_id,
+                call_type=call.type,
+                conversation_id=call.conversation_id,
+                caller_id=caller_id,
+                callee_ids=callee_ids,
+            )
 
 
 async def initiate_direct_call(
@@ -504,7 +517,10 @@ async def initiate_direct_call(
             },
         )
         await call_deadlines.schedule(call_deadlines.RING, str(call_id), RING_TIMEOUT_SECONDS)
-        if not callee_online:
+        # The calls preference silences the push only. The ring itself still goes
+        # out over the socket and the call still rings for its window — turning off
+        # call notifications is not the same as refusing calls.
+        if not callee_online and _wants_call_push(callee):
             _dispatch_call_push(callee.id, caller, ctype, call_id)
         logger.info(
             "call.initiated call_id=%s caller_id=%s callee_id=%s type=%s callee_online=%s",
@@ -546,6 +562,64 @@ def _dispatch_call_push(callee_id, caller: User, ctype: CallType, call_id) -> No
                 "url": "/chat",
             },
         )
+
+
+def _wants_call_push(user: User | None) -> bool:
+    """The user's `calls` notification preference. Never raises: a malformed row
+    must not stop a call from ringing, so anything unexpected reads as "push"."""
+    try:
+        return user is not None and effective_prefs(user.notification_prefs)["calls"]
+    except Exception:
+        return True
+
+
+async def _push_missed_call(
+    db: AsyncSession,
+    *,
+    call_id: uuid.UUID,
+    call_type: CallType,
+    conversation_id: uuid.UUID | None,
+    caller_id: uuid.UUID | None,
+    callee_ids: list[uuid.UUID],
+) -> None:
+    """Tell the callee(s) of a DIRECT call that was never answered.
+
+    Sent with the same tag as the ringing push, `call:{call_id}`, on purpose: the
+    platform replaces a notification that shares a tag, so a device still showing
+    "Incoming call" flips to "Missed call" instead of ringing on forever after the
+    call is gone. Sent whether or not the callee was online — the ring push only
+    goes to offline callees, but a missed call is worth a record in the tray either
+    way, and the replace is harmless when there is nothing to replace.
+
+    Fire-and-forget like every other push, and swallowed entirely: this runs after
+    the call is already finalised, so an exception escaping here would surface as
+    a failed ring timeout or cancel (and a sweeper retry) for a call that resolved
+    correctly.
+    """
+    try:
+        if not callee_ids:
+            return
+        caller = await db.get(User, caller_id) if caller_id else None
+        callees = (await db.execute(select(User).where(User.id.in_(callee_ids)))).scalars().all()
+        targets = [u.id for u in callees if _wants_call_push(u)]
+        if not targets:
+            return
+        from app.services.push import dispatch_push_to_users
+
+        dispatch_push_to_users(
+            targets,
+            {
+                "title": caller.display_name if caller else "Missed call",
+                "body": "Missed video call" if call_type == CallType.video else "Missed voice call",
+                "tag": f"call:{call_id}",
+                "kind": "missed_call",
+                "call_id": str(call_id),
+                "conversation_id": str(conversation_id) if conversation_id else None,
+                "url": f"/chat?c={conversation_id}" if conversation_id else "/chat",
+            },
+        )
+    except Exception:
+        logger.warning("call.missed_push_failed call_id=%s", call_id, exc_info=True)
 
 
 async def initiate_group_call(user: User, conversation_id: uuid.UUID, call_type: str) -> None:
@@ -612,8 +686,16 @@ async def initiate_group_call(user: User, conversation_id: uuid.UUID, call_type:
         await _set_in_call([caller.id], call_id)
 
         others = [u for u in member_ids if u != caller.id]
+        # Nobody already in another call is rung: a ring replaces the call screen on
+        # a client that does not guard against it. They still get `call:group_active`
+        # below, so the call stays joinable once they are free.
+        ring_to = []
+        for uid in others:
+            busy_in = await current_call_of(uid)
+            if not busy_in or busy_in == str(call_id):
+                ring_to.append(uid)
         await publish_to_users(
-            others,
+            ring_to,
             {
                 "type": "call:incoming",
                 "call_id": str(call_id),
@@ -738,6 +820,11 @@ async def invite_to_call(user: User, call_id: uuid.UUID, invitee_ids: list[uuid.
                     continue
             elif invitee.org_id != inviter.org_id:
                 outcome[str(invitee_id)] = "different_org"
+                continue
+            # On another call: ringing them would take over that call's screen.
+            busy_in = await current_call_of(invitee_id)
+            if busy_in and busy_in != str(call_id):
+                outcome[str(invitee_id)] = "unavailable"
                 continue
             # The cap counts people IN the call, plus the ones being added — an invite
             # that would overfill the room has to be refused now rather than at their
@@ -952,9 +1039,20 @@ async def _cancel(user: User, call_id: uuid.UUID) -> None:
             return
         ids = await _call_participant_ids(db, call_id)
         await _finalize(db, call, CallStatus.cancelled)
-        await publish_to_users(
-            [u for u in ids if u != user.id], {"type": "call:cancelled", "call_id": str(call_id)}
-        )
+        callee_ids = [u for u in ids if u != user.id]
+        await publish_to_users(callee_ids, {"type": "call:cancelled", "call_id": str(call_id)})
+        # The caller hung up before anyone answered: from the callee's side that is
+        # a missed call, and their device may still be showing the ring push. Also
+        # reached when the caller's link died mid-ring (_grace_expired).
+        if not call.is_group:
+            await _push_missed_call(
+                db,
+                call_id=call_id,
+                call_type=call.type,
+                conversation_id=call.conversation_id,
+                caller_id=call.initiated_by,
+                callee_ids=callee_ids,
+            )
 
 
 async def _end(user: User, call_id: uuid.UUID, reason: str = "normal") -> None:
@@ -985,6 +1083,24 @@ async def _end(user: User, call_id: uuid.UUID, reason: str = "normal") -> None:
             return
         member.left_at = now_utc()
         ids = await _call_participant_ids(db, call_id)
+        # A group call's roster includes people who never answered; `call:ended` is
+        # for the ones in the room, and the rest learn from `call:group_ended` below.
+        ended_to = [u for u in ids if u != user.id]
+        if call.is_group:
+            in_room = (
+                (
+                    await db.execute(
+                        select(CallParticipant.user_id).where(
+                            CallParticipant.call_id == call_id,
+                            CallParticipant.joined_at.is_not(None),
+                            CallParticipant.left_at.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            ended_to = [u for u in in_room if u != user.id]
         final = CallStatus.answered if call.answered_at else CallStatus.cancelled
         duration_note = None
         if call.answered_at:
@@ -997,7 +1113,7 @@ async def _end(user: User, call_id: uuid.UUID, reason: str = "normal") -> None:
         await _finalize(db, call, final, system_note=duration_note)
         logger.info("call.ended call_id=%s by=%s reason=%s", call_id, user.id, reason)
         await publish_to_users(
-            [u for u in ids if u != user.id],
+            ended_to,
             {
                 "type": "call:ended",
                 "call_id": str(call_id),
@@ -1005,6 +1121,17 @@ async def _end(user: User, call_id: uuid.UUID, reason: str = "normal") -> None:
                 "duration": _duration_of(call),
             },
         )
+        if call.is_group:
+            # Same frame as the last-one-out path in `_leave`: clears every member's
+            # "Join" bar and stops the ring for anyone who never answered.
+            await publish_to_users(
+                ids,
+                {
+                    "type": "call:group_ended",
+                    "call_id": str(call_id),
+                    "conversation_id": str(call.conversation_id) if call.conversation_id else None,
+                },
+            )
 
 
 async def _join(user: User, call_id: uuid.UUID) -> None:
@@ -1249,7 +1376,12 @@ async def active_call_state(db: AsyncSession, user_id: uuid.UUID) -> dict | None
             CallParticipant.user_id == user_id,
             Call.status.in_((CallStatus.ringing, CallStatus.connected)),
         )
-        .order_by(Call.started_at.desc())
+        # The call the user is IN first: a group call started later in one of their
+        # conversations (a roster row, never joined) must not shadow it on resume.
+        .order_by(
+            (CallParticipant.joined_at.is_not(None) & CallParticipant.left_at.is_(None)).desc(),
+            Call.started_at.desc(),
+        )
         .limit(1)
     )
     call = (await db.execute(stmt)).scalars().first()

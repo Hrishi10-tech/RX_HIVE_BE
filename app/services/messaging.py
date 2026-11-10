@@ -6,6 +6,7 @@ the Mongo build: HTTP sends were stored but never broadcast).
 """
 
 import datetime as dt
+import logging
 import re
 import uuid
 
@@ -18,6 +19,7 @@ from app.core.deps import PasswordChangeRequiredError
 from app.db.models import (
     Conversation,
     ConversationParticipant,
+    ConversationType,
     Message,
     MessageAttachment,
     MessagePin,
@@ -30,7 +32,10 @@ from app.db.models import (
 )
 from app.realtime.redis_bus import publish_to_users
 from app.services import enrich, presence
+from app.services.notification_prefs import effective_prefs, is_muted_now
 from app.utils import now_utc, sanitize_text
+
+logger = logging.getLogger(__name__)
 
 _MEDIA_TYPES = {"image", "video", "audio", "file"}
 _UPLOAD_URL_RE = re.compile(r"/api/media/up/([0-9a-f-]{36})")
@@ -58,6 +63,54 @@ def _push_preview(doc: dict) -> str:
         return f"📄 {doc.get('filename') or 'Document'}"
     body = doc.get("content") or ""
     return body[:120]
+
+
+# The whole body of a push for a user who turned previews off. Deliberately the
+# same for groups as for direct chats — not "<Sender>: New message" — so a locked
+# screen discloses no more than "something arrived in <chat>".
+_PUSH_NO_PREVIEW_BODY = "New message"
+
+
+async def _dispatch_message_push(
+    db: AsyncSession, conv: Conversation, sender: User, doc: dict, recipients: list[uuid.UUID]
+) -> None:
+    """Push a new message to `recipients` (already offline and unmuted), honouring
+    each one's notification preferences.
+
+    Preferences are per recipient, so the fan-out splits into at most two
+    dispatches: one with the preview and one without. Group chats are titled with
+    the group's name and prefix the body with the sender, the way every phone
+    renders a group alert; direct chats keep the sender as the title.
+    """
+    from app.services.push import dispatch_push_to_users
+
+    is_group = conv.type != ConversationType.direct
+    category = "groups" if is_group else "messages"
+    rows = (await db.execute(select(User.id, User.notification_prefs).where(User.id.in_(recipients)))).all()
+    stored = {row.id: row.notification_prefs for row in rows}
+    with_preview: list[uuid.UUID] = []
+    without_preview: list[uuid.UUID] = []
+    for uid in recipients:
+        prefs = effective_prefs(stored.get(uid))
+        if not prefs[category]:
+            continue
+        (with_preview if prefs["show_preview"] else without_preview).append(uid)
+
+    title = (conv.name or "Group") if is_group else sender.display_name
+    common = {
+        "tag": str(conv.id),
+        "kind": "message",
+        # conversation_id lets sw.js tell a focused tab WHICH chat to open;
+        # the url is the fallback for when it has to open a new window.
+        "conversation_id": str(conv.id),
+        "url": f"/chat?c={conv.id}",
+    }
+    if with_preview:
+        preview = _push_preview(doc)
+        body = f"{sender.display_name}: {preview}" if is_group else preview
+        dispatch_push_to_users(with_preview, {"title": title, "body": body, **common})
+    if without_preview:
+        dispatch_push_to_users(without_preview, {"title": title, "body": _PUSH_NO_PREVIEW_BODY, **common})
 
 
 class SendError(HTTPException):
@@ -527,24 +580,19 @@ async def send_message(
     # notifications" silenced neither the in-app path nor push. Filter here rather
     # than inside push_to_users so the mute is evaluated against this
     # conversation's participants, which we already hold.
-    muted = {p.user_id for p in participants if p.is_muted}
+    #
+    # is_muted_now, not p.is_muted: a timed mute that has lapsed still has the flag
+    # set, and must stop silencing the chat the moment it expires.
+    muted_check_at = now_utc()
+    muted = {p.user_id for p in participants if is_muted_now(p, muted_check_at)}
     offline = [uid for uid in offline if uid not in muted]
     if offline:
-        from app.services.push import dispatch_push_to_users
-
-        preview = _push_preview(doc)
-        dispatch_push_to_users(
-            offline,
-            {
-                "title": sender.display_name,
-                "body": preview,
-                "tag": str(conv.id),
-                # conversation_id lets sw.js tell a focused tab WHICH chat to open;
-                # the url is the fallback for when it has to open a new window.
-                "conversation_id": str(conv.id),
-                "url": f"/chat?c={conv.id}",
-            },
-        )
+        # The message is committed and broadcast by now, so nothing about push —
+        # including the preference lookup — may turn this send into an error.
+        try:
+            await _dispatch_message_push(db, conv, sender, doc, offline)
+        except Exception:
+            logger.exception("message push dispatch failed conversation_id=%s", conv.id)
 
     doc["temp_id"] = temp_id
     doc["status"] = "sent"
@@ -894,9 +942,16 @@ async def forward_message(
     message_id: uuid.UUID,
     conversation_ids: list[str],
     contact_ids: list[str],
+    copies: list[dict] | None = None,
 ) -> list[str]:
     """Forward a message. The actor must be a member of the SOURCE conversation
-    (closes the exfiltration IDOR) and of every target conversation."""
+    (closes the exfiltration IDOR) and of every target conversation.
+
+    `copies`, when given, receives each new message as serialized for the actor.
+    The fan-out below deliberately skips the actor (a `new_message` for their own
+    message would raise their unread count), so the forwarder's client needs the
+    copies from the HTTP response to show them — without that, a forward into
+    the open chat or any sidebar chat stayed invisible until a reload."""
     original = await enrich.load_message(db, message_id)
     if original is None:
         raise SendError(status_code=404, detail="Message not found")
@@ -955,6 +1010,8 @@ async def forward_message(
         others = [p.user_id for p in visible if p.user_id != actor.id]
         await publish_to_users(others, {"type": "new_message", "message": {**doc, "status": "delivered"}})
         forwarded_to.append(str(conv.id))
+        if copies is not None:
+            copies.append({**doc, "status": "sent"})
 
     for cid in conversation_ids or []:
         try:

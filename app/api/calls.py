@@ -506,6 +506,16 @@ async def _handle_webhook_event(db: AsyncSession, event) -> None:
                 "duration": calls_service._duration_of(call),
             },
         )
+        if call.is_group:
+            # Clears the members' "Join" bar and any ring nobody answered.
+            await publish_to_users(
+                ids,
+                {
+                    "type": "call:group_ended",
+                    "call_id": str(call.id),
+                    "conversation_id": str(call.conversation_id) if call.conversation_id else None,
+                },
+            )
 
 
 @webhook_router.post("/api/livekit/webhook")

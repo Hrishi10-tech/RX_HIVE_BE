@@ -146,6 +146,12 @@ class User(Base):
     # Nullable with no default on purpose — every existing row is correctly "never
     # reset", and the ALTER stays a metadata-only change.
     sessions_valid_after: Mapped[dt.datetime | None]
+    # Push notification preferences, stored on the server because the server is
+    # what sends push. Holds only the keys a user has changed; read it through
+    # services/notification_prefs.effective_prefs, which fills in the defaults —
+    # so adding a preference later needs no backfill. '{}' server default keeps
+    # the ALTER metadata-only and means "everything at its default".
+    notification_prefs: Mapped[dict] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
     last_seen_at: Mapped[dt.datetime | None]
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     created_at: Mapped[dt.datetime] = _now()
@@ -230,6 +236,11 @@ class ConversationParticipant(Base):
     # whenever any of them received a message.
     pin_order: Mapped[int | None] = mapped_column(default=None)
     is_muted: Mapped[bool] = mapped_column(default=False)
+    # When a timed mute ("8 hours", "1 week") lapses. NULL with is_muted set is
+    # "muted always". A lapsed mute is NOT cleared by anything — it simply stops
+    # counting, so every reader must go through
+    # services/notification_prefs.is_muted_now rather than read is_muted alone.
+    muted_until: Mapped[dt.datetime | None]
     joined_at: Mapped[dt.datetime] = _now()
 
     conversation: Mapped[Conversation] = relationship(back_populates="participants")

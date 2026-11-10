@@ -18,6 +18,7 @@ Deliberate fixes vs the Mongo build (docs/reference/api-conversations-messages.m
 
 import datetime as dt
 import uuid
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -40,7 +41,8 @@ from app.db.session import get_db
 from app.realtime.redis_bus import publish_to_users
 from app.services import enrich, messaging, presence
 from app.services.conversations import get_or_create_direct
-from app.utils import parse_uuid
+from app.services.notification_prefs import MUTE_DURATIONS, active_muted_until, is_muted_now
+from app.utils import iso_z, now_utc, parse_uuid
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
@@ -300,18 +302,45 @@ async def toggle_pin(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
     return {"is_pinned": me.is_pinned, "pin_order": me.pin_order}
 
 
+class MuteRequest(BaseModel):
+    # None (or no body at all) keeps the original blind toggle.
+    duration: Literal["8h", "1w", "always", "off"] | None = None
+
+
 @router.put("/{conv_id}/mute")
-async def toggle_mute(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
-    """Toggle MY mute flag. Per-participant, so it can't perturb anyone else."""
+async def toggle_mute(
+    conv_id: str,
+    body: MuteRequest | None = None,
+    tenant: TenantContext = Depends(get_tenant),
+):
+    """Set or toggle MY mute. Per-participant, so it can't perturb anyone else.
+
+    With no body this is the original toggle, which the iOS and Android apps still
+    send. The toggle reads the EFFECTIVE state, not the stored flag: a lapsed
+    "8 hours" mute still has is_muted set, and flipping that would "unmute" a chat
+    the user already sees as unmuted. So toggling from not-muted always lands on
+    "muted always", exactly what the toggle did before timed mutes existed.
+    """
     conv_uuid = _conv_uuid(conv_id)
     conv = await tenant.require_membership(conv_uuid)
     if not conv.is_active:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     me = await tenant.db.get(ConversationParticipant, (conv_uuid, tenant.user.id))
-    me.is_muted = not me.is_muted
+    now = now_utc()
+    duration = body.duration if body is not None else None
+    if duration is None:
+        duration = "off" if is_muted_now(me, now) else "always"
+
+    if duration == "off":
+        me.is_muted = False
+        me.muted_until = None
+    else:
+        span = MUTE_DURATIONS[duration]
+        me.is_muted = True
+        me.muted_until = now + span if span is not None else None
     await tenant.db.commit()
-    return {"is_muted": me.is_muted}
+    return {"is_muted": is_muted_now(me, now), "muted_until": iso_z(active_muted_until(me, now))}
 
 
 async def _hide_all_messages_for_caller(db: AsyncSession, conv_uuid: uuid.UUID, user_id: uuid.UUID) -> None:

@@ -16,7 +16,7 @@ import pathlib
 
 import pytest
 
-_SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "rxhive" / "scripts" / "check_pinned_imports.py"
+_SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "check_pinned_imports.py"
 
 
 def _load():

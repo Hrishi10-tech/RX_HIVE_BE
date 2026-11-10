@@ -112,8 +112,11 @@ async def test_mute_toggle(client, two_orgs_with_users):
     await login(client, "alice@a.com")
     conv = await _direct(client, users["bob"].id)
 
-    assert (await client.put(f"/api/conversations/{conv}/mute")).json() == {"is_muted": True}
-    assert (await client.put(f"/api/conversations/{conv}/mute")).json() == {"is_muted": False}
+    # No body: the original blind toggle, still what the mobile apps send.
+    resp = await client.put(f"/api/conversations/{conv}/mute")
+    assert resp.json() == {"is_muted": True, "muted_until": None}
+    resp = await client.put(f"/api/conversations/{conv}/mute")
+    assert resp.json() == {"is_muted": False, "muted_until": None}
 
 
 async def test_conversation_pin_order_and_isolation(client, two_orgs_with_users):
@@ -531,7 +534,7 @@ async def test_mute_suppresses_push_dispatch(client, two_orgs_with_users, monkey
     # Bob mutes the conversation.
     async with _client_for("bob@a.com") as bob:
         resp = await bob.put(f"/api/conversations/{conv}/mute")
-        assert resp.json() == {"is_muted": True}
+        assert resp.json() == {"is_muted": True, "muted_until": None}
 
     dispatched.clear()
     await _send(client, conv, "should NOT push")

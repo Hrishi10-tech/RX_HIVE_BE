@@ -30,6 +30,7 @@ from app.db.models import (
     User,
 )
 from app.services import presence
+from app.services.notification_prefs import active_muted_until, is_muted_now
 from app.utils import iso_z
 
 
@@ -48,6 +49,10 @@ def serialize_user_brief(user: User, status: str = "offline") -> dict:
         "avatar_url": user.avatar_url,
         "status": status,
         "last_seen": iso_z(user.last_seen_at),
+        # A plain column on users, so no extra query. The cross-org header counts
+        # distinct values of this to say "N members from M organizations"; it used
+        # to read an `org_name` nothing sent, and always rendered "?".
+        "org_id": str(user.org_id) if user.org_id else None,
     }
 
 
@@ -264,7 +269,11 @@ async def serialize_conversation(
         # Mute was stored and toggleable but never sent back, so every client read
         # it as False after a reload — and since PUT /mute is a blind flip, the
         # menu offered "Mute" on an already-muted chat and unmuted it instead.
-        "is_muted": bool(me and me.is_muted),
+        #
+        # Effective, not stored: a timed mute that has lapsed is served as unmuted,
+        # and muted_until is null unless a timed mute is still in force.
+        "is_muted": is_muted_now(me),
+        "muted_until": iso_z(active_muted_until(me)),
     }
     if is_group:
         doc["description"] = conv.description

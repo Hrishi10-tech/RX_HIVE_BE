@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     rate_limit_password: int = 5
     rate_limit_upload: int = 30
     rate_limit_push_subscribe: int = 10
+    # Uncached link-preview fetches. Per IP, and an office shares one IP, so
+    # this is set for a whole team; cache hits are not counted.
+    rate_limit_link_preview: int = 60
+
+    # Link previews make the server fetch pasted URLs (through the public-only
+    # address guard in services/push.py). Set false to turn the feature off.
+    link_previews_enabled: bool = True
 
     s3_endpoint: str = "http://localhost:9000"
     # Endpoint the *browser* uses for presigned URLs. May be a bare path like "/s3"

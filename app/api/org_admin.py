@@ -399,6 +399,17 @@ async def update_user(
 ):
     target = await _load_org_user(db, admin, user_id)
 
+    # _load_org_user lets an admin resolve their own row so they can rename
+    # themselves, but deactivating or demoting yourself is a lockout: the portal
+    # is gone the moment it commits, and only a superadmin can grant it back.
+    # Refused before anything is written. The drawer sends every field on save,
+    # so a no-op is_active=True / role="admin" must still pass.
+    if target.id == admin.id:
+        if body.is_active is False:
+            raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
+        if body.role is not None and _ROLE_MAP.get(body.role, UserRole.org_admin) is not UserRole.org_admin:
+            raise HTTPException(status_code=400, detail="You cannot remove your own admin access")
+
     changes: dict = {}
     if body.display_name is not None:
         cleaned = sanitize_text(body.display_name).strip()

@@ -16,7 +16,7 @@ import pathlib
 
 import pytest
 
-_SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "rxhive" / "scripts" / "check_dependabot_coverage.py"
+_SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "check_dependabot_coverage.py"
 
 
 def _load():

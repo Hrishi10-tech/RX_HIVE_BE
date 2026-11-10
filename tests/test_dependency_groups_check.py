@@ -26,10 +26,10 @@ import textwrap
 
 import pytest
 
-_ROOT = pathlib.Path(__file__).resolve().parents[2] / "rxhive"
+_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SCRIPT = _ROOT / "scripts" / "check_dependency_groups.py"
-_RUNTIME = _ROOT.parent / "backend" / "requirements.txt"
-_DEV = _ROOT.parent / "backend" / "requirements-dev.txt"
+_RUNTIME = _ROOT / "backend" / "requirements.txt"
+_DEV = _ROOT / "backend" / "requirements-dev.txt"
 _MANIFESTS = [str(_RUNTIME), str(_DEV)]
 
 
